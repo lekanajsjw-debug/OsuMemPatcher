@@ -350,15 +350,21 @@ public class MainActivity extends Activity {
             byte[] search  = searches[i];
             byte[] replace = replaces[i];
             String desc    = descs[i];
+            log("→ Патч: " + desc);
 
             for (long[] reg : regions) {
                 long size = reg[1] - reg[0];
+                log("  Сканирую: 0x" + Long.toHexString(reg[0]) + " size=" + size);
+                
                 String hex = su("python3 -c \"" +
                     "f=open('/proc/" + pid + "/mem','rb');f.seek(" + reg[0] + ");" +
                     "d=f.read(" + size + ");f.close();print(d.hex())\" 2>/dev/null");
                 if (hex.trim().isEmpty()) continue;
                 byte[] data;
-                try { data = hexToBytes(hex.trim()); } catch (Exception e) { continue; }
+                try { data = hexToBytes(hex.trim()); } catch (Exception e) { 
+                    log("Ошибка чтения: " + e.getMessage());
+                    continue; 
+                }
 
                 int idx = 0, hit;
                 while ((hit = indexOf(data, search, idx)) != -1) {
@@ -366,7 +372,7 @@ public class MainActivity extends Activity {
                     su("python3 -c \"" +
                         "f=open('/proc/" + pid + "/mem','r+b',0);f.seek(" + addr + ");" +
                         "f.write(bytes.fromhex('" + bytesToHex(replace) + "'));f.close()\" 2>/dev/null");
-                    log("✓ " + desc + "  @0x" + Long.toHexString(addr));
+                    log("✓ " + desc + " @0x" + Long.toHexString(addr));
                     total++;
                     idx = hit + replace.length;
                 }
@@ -387,7 +393,7 @@ public class MainActivity extends Activity {
 
     private String su(String cmd) {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            java.lang.Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             StringBuilder sb = new StringBuilder();
             String l; while ((l = br.readLine()) != null) sb.append(l).append("\n");
