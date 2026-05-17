@@ -372,7 +372,7 @@ public class MainActivity extends Activity {
     // ─────────────────────────── UTILS ────────────────────────────────────
     private String shell(String cmd) {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            java.lang.Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             StringBuilder sb = new StringBuilder();
             String line;
