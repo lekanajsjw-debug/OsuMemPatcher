@@ -5,8 +5,6 @@ import android.os.*;
 import android.widget.*;
 import android.view.*;
 import android.graphics.*;
-import android.content.*;
-import android.text.*;
 import java.io.*;
 import java.util.*;
 import java.nio.*;
@@ -14,112 +12,35 @@ import java.nio.ByteOrder;
 
 public class MainActivity extends Activity {
 
-    private TextView tvStatus, tvLog;
-    private Button btnPatch, btnUnpatch, btnRefresh;
+    private TextView tvStatus, tvLog, tvOD, tvWindows;
     private ScrollView scrollLog;
     private Handler mainHandler = new Handler(Looper.getMainLooper());
     private StringBuilder logBuf = new StringBuilder();
-    
-    // ── VERSION DETECTION ──────────────────────────────────────────
-    // osu!lazer package names
-    static final String[] PKG_NAMES = {"sh.ppy.osulazer", "sh.ppy.osu", "com.ppy.osu"};
-    
-    // Version signatures (unique patterns per version)
-    // These help identify game version before patching
-    static final Signature[] VERSION_SIGS = {
-        new Signature("2024.x", hexToBytes("000000000000544000000000000049400000000000003440"), 0),
-        new Signature("2023.x", hexToBytes("000000000000504000000000000049400000000000003440"), 0),
-    };
-    
-    // ── IMPROVED PATCH PATTERNS ──────────────────────────────────────────
-    // Pattern: [context bytes] + [target] + [more context]
-    // Using context makes patterns more unique and stable
-    
-    // DifficultyRanges: has form [min:double, mid:double, max:double]
-    // Context: nearby vtable pointers or method references
-    static final PatchRecord[] PATCHES = {
-        // ── Hit Windows for osu! ─────────────────────────────────
-        // GREAT (300) timing window - context: nearby string or vtable
-        new PatchRecord(
-            "GREAT",  // name
-            hexToBytes("000000000000544000000000000049400000000000003440"), // pattern (80/50/20)
-            hexToBytes("000000000000794000000000000079400000000000007940"), // replace (400/400/400)
-            "Timing300: 80ms -> 400ms"
-        ),
-        // OK (100) timing window  
-        new PatchRecord(
-            "OK",
-            hexToBytes("000000000080614000000000000059400000000000004e40"), // 140/100/60
-            hexToBytes("0000000000407f400000000000407f400000000000407f40"), // 500/500/500  
-            "Timing100: 140ms -> 500ms"
-        ),
-        // MEH (50) timing window
-        new PatchRecord(
-            "MEH", 
-            hexToBytes("00000000000069400000000000c062400000000000005940"), // 200/150/100
-            hexToBytes("0000000000c082400000000000c082400000000000c08240"), // 600/600/600
-            "Timing50: 200ms -> 600ms"
-        ),
-        // ── Miss Window ──────────────────────────────────────
-        new PatchRecord(
-            "MISS",
-            hexToBytes("0000000000007940"),  // 400.0
-            hexToBytes("0000000000e08540"),  // 700.0
-            "MissWindow: 400ms -> 700ms"
-        ),
-        // ── Circle Size (AR affects this) ──────────────────────────────
-        new PatchRecord(
-            "CS",
-            hexToBytes("00008042"),  // 64.0f (OBJECT_RADIUS)
-            hexToBytes("0000c042"),  // 96.0f
-            "CircleSize: 64 -> 96"
-        ),
-        // ── Approach Rate ────────────────────────────────────────────
-        new PatchRecord(
-            "AR",
-            hexToBytes("0000803f"),  // 1.0f typical default
-            hexToBytes("0000a041"), // 10.0f - faster approach
-            "ApproachRate: 1x -> 10x"
-        ),
-        // ── OD (Overall Difficulty) ────────────────────────────────
-        new PatchRecord(
-            "OD",
-            hexToBytes("0000c83f"), // 1.6f default
-            hexToBytes("0000a041"),  // 10.0f max OD
-            "OD: 1.6 -> 10"
-        ),
-    };
-    
-    static class Signature {
-        String version;
-        byte[] pattern;
-        int offset;
-        Signature(String v, byte[] p, int o) { version=v; pattern=p; offset=o; }
-    }
-    
-    static class PatchRecord {
-        String name;
-        byte[] search;
-        byte[] replace;
-        String desc;
-        PatchRecord(String n, byte[] s, byte[] r, String d) { 
-            name=n; search=s; replace=r; desc=d; 
-        }
-    }
+    private String currentPid = null;
+
+    // Текущие вычисленные окна (заполняются после чтения OD)
+    private double odValue    = -1;
+    private double wGreat, wOk, wMeh;
+    private static final double W_MISS_ORIG = 400.0;
+    private static final double W_MISS_NEW  = 700.0;
+
+    // Новые значения окон (фиксированные)
+    private static final double NEW_GREAT = 400.0;
+    private static final double NEW_OK    = 500.0;
+    private static final double NEW_MEH   = 600.0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildUI();
-        log("osu! Memory Patcher готов");
-        log("1. Открой osu! и зайди в выбор карты");
-        log("2. Нажми PATCH");
+        log("1. Открой osu! и выбери карту в song select");
+        log("2. Нажми НАЙТИ OD — считает OD текущей карты");
+        log("3. Нажми APPLY PATCH");
         refreshPid();
     }
 
-    // ─────────────────────────── UI ───────────────────────────────────────
+    // ─────────────────────── UI ───────────────────────────────────────────
     private void buildUI() {
-        // Root layout
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.parseColor("#0f0f1a"));
@@ -127,76 +48,56 @@ public class MainActivity extends Activity {
 
         // Title
         TextView title = new TextView(this);
-        title.setText("osu! Memory Patcher");
+        title.setText("osu! HitWindow Patcher");
         title.setTextColor(Color.parseColor("#ff66aa"));
-        title.setTextSize(26);
+        title.setTextSize(22);
         title.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        title.setPadding(0, 0, 0, 4);
+        title.setPadding(0, 0, 0, 16);
         root.addView(title);
 
-        TextView sub = new TextView(this);
-        sub.setText("прямой патч RAM • root required");
-        sub.setTextColor(Color.parseColor("#888888"));
-        sub.setTextSize(12);
-        sub.setTypeface(Typeface.MONOSPACE);
-        sub.setPadding(0, 0, 0, 24);
-        root.addView(sub);
+        // Status row
+        root.addView(makeRow("STATUS  ", "...", "#888888", (tv) -> tvStatus = tv));
 
-        // Status
-        LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setOrientation(LinearLayout.HORIZONTAL);
-        TextView statusLabel = new TextView(this);
-        statusLabel.setText("STATUS  ");
-        statusLabel.setTextColor(Color.parseColor("#555555"));
-        statusLabel.setTextSize(13);
-        statusLabel.setTypeface(Typeface.MONOSPACE);
-        tvStatus = new TextView(this);
-        tvStatus.setText("Ожидание...");
-        tvStatus.setTextColor(Color.parseColor("#888888"));
-        tvStatus.setTextSize(13);
-        tvStatus.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        statusRow.addView(statusLabel);
-        statusRow.addView(tvStatus);
-        root.addView(statusRow);
+        // OD info
+        root.addView(makeRow("OD      ", "не определён", "#888888", (tv) -> tvOD = tv));
 
-        View divider = new View(this);
-        divider.setBackgroundColor(Color.parseColor("#222233"));
-        LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 1);
-        dp.setMargins(0, 16, 0, 16);
-        root.addView(divider, dp);
+        // Windows info
+        tvWindows = new TextView(this);
+        tvWindows.setText("окна тайминга: ?");
+        tvWindows.setTextColor(Color.parseColor("#666666"));
+        tvWindows.setTextSize(11);
+        tvWindows.setTypeface(Typeface.MONOSPACE);
+        tvWindows.setPadding(0, 4, 0, 0);
+        root.addView(tvWindows);
+
+        addDiv(root, 16);
 
         // Buttons
-        btnPatch = makeButton("APPLY PATCH", "#cc3366");
-        btnUnpatch = makeButton("REMOVE PATCH", "#333355");
-        btnRefresh = makeButton("ОБНОВИТЬ PID", "#223322");
+        Button btnFindOD  = makeBtn("НАЙТИ OD КАРТЫ",  "#1a2a3a");
+        Button btnPatch   = makeBtn("APPLY PATCH",      "#cc3366");
+        Button btnRemove  = makeBtn("REMOVE PATCH",     "#333355");
+        Button btnRefresh = makeBtn("ОБНОВИТЬ PID",     "#1a2a1a");
 
-        btnPatch.setOnClickListener(v -> doPatch(false));
-        btnUnpatch.setOnClickListener(v -> doPatch(true));
+        btnFindOD .setOnClickListener(v -> findOD());
+        btnPatch  .setOnClickListener(v -> doPatch(false));
+        btnRemove .setOnClickListener(v -> doPatch(true));
         btnRefresh.setOnClickListener(v -> refreshPid());
 
-        root.addView(btnPatch);
-        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT);
+        root.addView(btnFindOD);
+        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2);
         mp.setMargins(0, 8, 0, 0);
-        root.addView(btnUnpatch, mp);
+        root.addView(btnPatch, mp);
+        root.addView(btnRemove, mp);
         root.addView(btnRefresh, mp);
 
-        View div2 = new View(this);
-        div2.setBackgroundColor(Color.parseColor("#222233"));
-        LinearLayout.LayoutParams dp2 = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 1);
-        dp2.setMargins(0, 16, 0, 8);
-        root.addView(div2, dp2);
+        addDiv(root, 16);
 
-        // Log
-        TextView logLabel = new TextView(this);
-        logLabel.setText("LOG");
-        logLabel.setTextColor(Color.parseColor("#555555"));
-        logLabel.setTextSize(11);
-        logLabel.setTypeface(Typeface.MONOSPACE);
-        root.addView(logLabel);
+        TextView logLbl = new TextView(this);
+        logLbl.setText("LOG");
+        logLbl.setTextColor(Color.parseColor("#555555"));
+        logLbl.setTextSize(11);
+        logLbl.setTypeface(Typeface.MONOSPACE);
+        root.addView(logLbl);
 
         scrollLog = new ScrollView(this);
         tvLog = new TextView(this);
@@ -206,301 +107,308 @@ public class MainActivity extends Activity {
         tvLog.setPadding(8, 8, 8, 8);
         tvLog.setBackgroundColor(Color.parseColor("#0a0a14"));
         scrollLog.addView(tvLog);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, 0, 1f);
         lp.setMargins(0, 4, 0, 0);
         root.addView(scrollLog, lp);
 
         setContentView(root);
     }
 
-    private Button makeButton(String text, String color) {
+    interface TVCapture { void set(TextView tv); }
+    private LinearLayout makeRow(String label, String value, String color, TVCapture cap) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        TextView lbl = new TextView(this);
+        lbl.setText(label);
+        lbl.setTextColor(Color.parseColor("#555555"));
+        lbl.setTextSize(13);
+        lbl.setTypeface(Typeface.MONOSPACE);
+        TextView val = new TextView(this);
+        val.setText(value);
+        val.setTextColor(Color.parseColor(color));
+        val.setTextSize(13);
+        val.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        cap.set(val);
+        row.addView(lbl);
+        row.addView(val);
+        return row;
+    }
+
+    private Button makeBtn(String text, String color) {
         Button b = new Button(this);
         b.setText(text);
         b.setTextColor(Color.WHITE);
         b.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        b.setTextSize(15);
+        b.setTextSize(14);
         b.setBackgroundColor(Color.parseColor(color));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT);
-        b.setLayoutParams(lp);
+        b.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
         return b;
     }
 
-    // ─────────────────────────── PID ──────────────────────────────────────
-    private String currentPid = null;
+    private void addDiv(LinearLayout root, int margin) {
+        View div = new View(this);
+        div.setBackgroundColor(Color.parseColor("#222233"));
+        LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(-1, 1);
+        dp.setMargins(0, margin, 0, margin);
+        root.addView(div, dp);
+    }
 
+    // ─────────────────────── PID ──────────────────────────────────────────
     private void refreshPid() {
         setStatus("Ищу osu!...", "#888888");
         new Thread(() -> {
-            String pid = findOsuPid();
+            String pid = findPid();
             mainHandler.post(() -> {
-                if (pid != null) {
-                    currentPid = pid;
-                    setStatus("osu! найден  PID=" + pid, "#4CAF50");
-                    log("✓ osu! PID=" + pid);
-                } else {
-                    currentPid = null;
-                    setStatus("osu! не найден", "#FF5500");
-                    log("✗ osu! не запущен — запусти игру и нажми ОБНОВИТЬ PID");
-                }
+                currentPid = pid;
+                if (pid != null) { setStatus("osu! PID=" + pid, "#4CAF50"); log("✓ PID=" + pid); }
+                else             { setStatus("osu! не найден", "#FF5500"); log("✗ Запусти osu! и нажми ОБНОВИТЬ PID"); }
             });
         }).start();
     }
 
-    private String findOsuPid() {
-        String[] pkgs = {"sh.ppy.osulazer", "sh.ppy.osu", "com.ppy.osu"};
-        for (String pkg : pkgs) {
-            String r = shell("pidof " + pkg).trim();
+    private String findPid() {
+        for (String pkg : new String[]{"sh.ppy.osulazer", "sh.ppy.osu"}) {
+            String r = su("pidof " + pkg).trim();
             if (!r.isEmpty()) return r.split("\\s+")[0];
-        }
-        // fallback через ps
-        String ps = shell("ps -A 2>/dev/null | grep -iE 'osulazer|ppy\\.osu'");
-        for (String line : ps.split("\n")) {
-            String[] parts = line.trim().split("\\s+");
-            if (parts.length > 1) return parts[1];
         }
         return null;
     }
 
-    // ─────────────────────────── PATCH ────────────────────────────────────
-    private void doPatch(boolean restore) {
-        if (currentPid == null) {
-            refreshPid();
-            log("! Сначала найди PID");
-            return;
-        }
-        setStatus(restore ? "Восстанавливаю..." : "Патчу...", "#FF9800");
-        btnPatch.setEnabled(false);
-        btnUnpatch.setEnabled(false);
-
-        final String pid = currentPid;
+    // ─────────────────────── OD FINDER ────────────────────────────────────
+    private void findOD() {
+        setStatus("Ищу OD карты...", "#FF9800");
+        log("── Ищу .osu файл ──");
         new Thread(() -> {
-            int total = patchMemory(pid, restore);
-            mainHandler.post(() -> {
-                btnPatch.setEnabled(true);
-                btnUnpatch.setEnabled(true);
-                if (total > 0) {
-                    setStatus(restore ? "Восстановлено ✓" : "PATCHED ✓", restore ? "#888888" : "#4CAF50");
-                } else {
-                    setStatus("Не найдено — зайди в карту и повтори", "#FF5500");
+            // osu! хранит файлы в /sdcard/osu/ или во внутреннем storage
+            // Ищем последний изменённый .osu файл — это текущая карта
+            String[] searchPaths = {
+                "/sdcard/osu",
+                "/sdcard/Android/data/sh.ppy.osulazer/files",
+                "/data/data/sh.ppy.osulazer/files",
+                "/storage/emulated/0/osu",
+                "/storage/emulated/0/Android/data/sh.ppy.osulazer/files"
+            };
+
+            String osuFile = null;
+            for (String path : searchPaths) {
+                // Ищем последний изменённый .osu файл
+                String f = su("find '" + path + "' -name '*.osu' 2>/dev/null " +
+                    "-exec ls -t {} + 2>/dev/null | head -1").trim();
+                if (f.isEmpty()) {
+                    // Попробуем через find с сортировкой по времени
+                    f = su("find '" + path + "' -name '*.osu' 2>/dev/null | " +
+                        "xargs ls -t 2>/dev/null | head -1").trim();
                 }
+                if (!f.isEmpty()) { osuFile = f; break; }
+            }
+
+            // Альтернатива: читаем последний открытый файл через /proc
+            if ((osuFile == null || osuFile.isEmpty()) && currentPid != null) {
+                String fds = su("ls -la /proc/" + currentPid + "/fd 2>/dev/null | grep '\\.osu' | tail -1");
+                if (!fds.isEmpty()) {
+                    for (String part : fds.split("\\s+")) {
+                        if (part.endsWith(".osu")) { osuFile = part; break; }
+                    }
+                }
+            }
+
+            final String finalFile = osuFile;
+            if (osuFile == null || osuFile.isEmpty()) {
+                mainHandler.post(() -> {
+                    log("✗ .osu файл не найден автоматически");
+                    log("  Попробуй: выбери карту в osu! и нажми снова");
+                    setStatus("OD не найден", "#FF5500");
+                });
+                return;
+            }
+
+            log("Файл: " + finalFile);
+
+            // Читаем OD из .osu файла
+            String content = su("cat '" + finalFile + "' 2>/dev/null | grep 'OverallDifficulty'");
+            double od = -1;
+            for (String line : content.split("\n")) {
+                if (line.contains("OverallDifficulty")) {
+                    try {
+                        od = Double.parseDouble(line.split(":")[1].trim());
+                        break;
+                    } catch (Exception ignored) {}
+                }
+            }
+
+            final double finalOD = od;
+            mainHandler.post(() -> {
+                if (finalOD < 0) {
+                    log("✗ OD не найден в файле");
+                    setStatus("OD не найден", "#FF5500");
+                    return;
+                }
+
+                odValue = finalOD;
+                // Формулы из osu! wiki
+                wGreat = 80 - 6 * odValue;
+                wOk    = 140 - 8 * odValue;
+                wMeh   = 200 - 10 * odValue;
+
+                tvOD.setText(String.format("%.1f", odValue));
+                tvOD.setTextColor(Color.parseColor("#ffcc44"));
+                tvWindows.setText(String.format(
+                    "GREAT ±%.0fмс  OK ±%.0fмс  MEH ±%.0fмс  MISS ±%.0fмс",
+                    wGreat, wOk, wMeh, W_MISS_ORIG));
+                tvWindows.setTextColor(Color.parseColor("#aaaacc"));
+
+                log(String.format("✓ OD=%.1f → GREAT=±%.0f OK=±%.0f MEH=±%.0f MISS=±%.0f",
+                    odValue, wGreat, wOk, wMeh, W_MISS_ORIG));
+                log(String.format("  После патча → GREAT=±%.0f OK=±%.0f MEH=±%.0f MISS=±%.0f",
+                    NEW_GREAT, NEW_OK, NEW_MEH, W_MISS_NEW));
+                setStatus("OD=" + String.format("%.1f", odValue) + " — готов к патчу", "#4CAF50");
             });
         }).start();
     }
 
-    private int patchMemory(String pid, boolean restore) {
-        String mapsPath = "/proc/" + pid + "/maps";
-        String memPath  = "/proc/" + pid + "/mem";
-
-        log("── Читаю карту памяти PID=" + pid + " ──");
-
-        // Получаем регионы через root cat (RandomAccessFile не дотянется без root)
-        String maps = shell("cat " + mapsPath + " 2>/dev/null");
-        if (maps.isEmpty()) {
-            log("✗ Не могу читать maps. Нет root?");
-            return 0;
+    // ─────────────────────── PATCH ────────────────────────────────────────
+    private void doPatch(boolean restore) {
+        if (currentPid == null) { log("! Сначала найди PID"); return; }
+        if (odValue < 0 && !restore) {
+            log("! Сначала нажми НАЙТИ OD КАРТЫ");
+            return;
         }
+
+        setStatus(restore ? "Восстанавливаю..." : "Патчу...", "#FF9800");
+        String pid = currentPid;
+
+        new Thread(() -> {
+            int n;
+            if (restore) {
+                // При restore ищем новые значения и заменяем на оригинальные
+                // Используем диапазон OD 0-10 для поиска любых пропатченных окон
+                n = patchWithKnownValues(pid, true);
+            } else {
+                n = patchWithKnownValues(pid, false);
+            }
+
+            final int total = n;
+            mainHandler.post(() -> {
+                if (total > 0) setStatus(restore ? "Восстановлено" : "PATCHED ✓ (" + total + ")", restore ? "#888888" : "#4CAF50");
+                else           setStatus("Не найдено — зайди в карту и повтори", "#FF5500");
+            });
+        }).start();
+    }
+
+    private int patchWithKnownValues(String pid, boolean restore) {
+        // Вычисляем точные байты для текущего OD
+        double srcGreat = restore ? NEW_GREAT : wGreat;
+        double srcOk    = restore ? NEW_OK    : wOk;
+        double srcMeh   = restore ? NEW_MEH   : wMeh;
+        double srcMiss  = restore ? W_MISS_NEW : W_MISS_ORIG;
+
+        double dstGreat = restore ? wGreat    : NEW_GREAT;
+        double dstOk    = restore ? wOk       : NEW_OK;
+        double dstMeh   = restore ? wMeh      : NEW_MEH;
+        double dstMiss  = restore ? W_MISS_ORIG : W_MISS_NEW;
+
+        // Паттерны для поиска — реальные вычисленные значения
+        byte[][] searches = {
+            doubleToBytes(srcGreat),
+            doubleToBytes(srcOk),
+            doubleToBytes(srcMeh),
+            doubleToBytes(srcMiss),
+        };
+        byte[][] replaces = {
+            doubleToBytes(dstGreat),
+            doubleToBytes(dstOk),
+            doubleToBytes(dstMeh),
+            doubleToBytes(dstMiss),
+        };
+        String[] descs = {
+            String.format("GREAT: ±%.0f → ±%.0fмс", srcGreat, dstGreat),
+            String.format("OK:    ±%.0f → ±%.0fмс", srcOk,    dstOk),
+            String.format("MEH:   ±%.0f → ±%.0fмс", srcMeh,   dstMeh),
+            String.format("MISS:  ±%.0f → ±%.0fмс", srcMiss,  dstMiss),
+        };
+
+        // Читаем карту памяти
+        String maps = su("cat /proc/" + pid + "/maps 2>/dev/null");
+        if (maps.isEmpty()) { log("✗ Нет доступа к maps. Root?"); return 0; }
 
         List<long[]> regions = new ArrayList<>();
         for (String line : maps.split("\n")) {
-            String[] parts = line.trim().split("\\s+");
-            if (parts.length < 2) continue;
-            String perms = parts[1];
-            if (!perms.contains("r")) continue;
-            String name = parts.length >= 6 ? parts[5] : "";
-            // Анонимные регионы и libaot-osu модули
-            if (!name.isEmpty() && !name.contains("libaot-osu") &&
-                !name.contains("[anon") && !name.equals("")) continue;
+            String[] p = line.trim().split("\\s+");
+            if (p.length < 2 || !p[1].contains("r")) continue;
+            String name = p.length >= 6 ? p[5] : "";
+            if (!name.isEmpty() && !name.contains("libaot-osu") && !name.contains("[anon")) continue;
             try {
-                String[] range = parts[0].split("-");
-                long start = Long.parseLong(range[0], 16);
-                long end   = Long.parseLong(range[1], 16);
-                long size  = end - start;
-                if (size > 0 && size <= 200L * 1024 * 1024)
-                    regions.add(new long[]{start, end});
+                String[] r = p[0].split("-");
+                long s = Long.parseLong(r[0], 16), e = Long.parseLong(r[1], 16);
+                if (e - s > 0 && e - s <= 64L * 1024 * 1024) regions.add(new long[]{s, e});
             } catch (Exception ignored) {}
         }
-        log("Регионов для сканирования: " + regions.size());
+        log("Регионов: " + regions.size());
 
-        // ─── SEACH IN REGION ─────────────────────────────────────────
-    private int searchRegion(String pid, List<long[]> regions, byte[] search, byte[] replace, String desc) {
-        int found = 0;
-        
-        for (long[] region : regions) {
-            long start = region[0];
-            long end = region[1];
-            long size = end - start;
-            
-            // Читаем по 4MB кускам
-            long pos = start;
-            while (pos < end) {
-                long chunkSize = Math.min(4 * 1024 * 1024, end - pos);
-                byte[] chunk = readMem(pid, pos, chunkSize);
-                if (chunk == null) { pos += chunkSize; continue; }
-                
-                int idx = 0;
-                while (true) {
-                    int hit = indexOf(chunk, search, idx);
-                    if (hit == -1) break;
-                    
-                    long absAddr = pos + hit;
-                    boolean ok = writeMem(pid, absAddr, replace);
-                    if (ok) {
-                        found++;
-                        log("✓ " + desc);
-                        log("  0x" + Long.toHexString(absAddr));
-                    }
-                    idx = hit + search.length;
+        int total = 0;
+        for (int i = 0; i < searches.length; i++) {
+            byte[] search  = searches[i];
+            byte[] replace = replaces[i];
+            String desc    = descs[i];
+
+            for (long[] reg : regions) {
+                long size = reg[1] - reg[0];
+                String hex = su("python3 -c \"" +
+                    "f=open('/proc/" + pid + "/mem','rb');f.seek(" + reg[0] + ");" +
+                    "d=f.read(" + size + ");f.close();print(d.hex())\" 2>/dev/null");
+                if (hex.trim().isEmpty()) continue;
+                byte[] data;
+                try { data = hexToBytes(hex.trim()); } catch (Exception e) { continue; }
+
+                int idx = 0, hit;
+                while ((hit = indexOf(data, search, idx)) != -1) {
+                    long addr = reg[0] + hit;
+                    su("python3 -c \"" +
+                        "f=open('/proc/" + pid + "/mem','r+b',0);f.seek(" + addr + ");" +
+                        "f.write(bytes.fromhex('" + bytesToHex(replace) + "'));f.close()\" 2>/dev/null");
+                    log("✓ " + desc + "  @0x" + Long.toHexString(addr));
+                    total++;
+                    idx = hit + replace.length;
                 }
-                pos += chunkSize;
             }
         }
-        if (found == 0) log("? Не найдено: " + desc);
-        
-        return found;
-    }
-    
-    // ─── PATCHMEM LEGACY (for reference) ────────────────────────────────
-    private int patchMemory(String pid, boolean restore) {
-        String mapsPath = "/proc/" + pid + "/maps";
-        log("── Читаю карту памяти PID=" + pid + " ──");
 
-        // Получаем регионы
-        String maps = shell("cat " + mapsPath + " 2>/dev/null");
-        if (maps.isEmpty()) {
-            log("✗ Не могу читать maps. Нет root?");
-            return 0;
-        }
-
-        List<long[]> regions = new ArrayList<>();
-        for (String line : maps.split("\n")) {
-            String[] parts = line.trim().split("\\s+");
-            if (parts.length < 2) continue;
-            String perms = parts[1];
-            if (!perms.contains("r")) continue;
-            String name = parts.length >= 6 ? parts[5] : "";
-            // Skip named libs, focus on anon + libaot
-            if (!name.isEmpty() && !name.contains("libaot-osu") &&
-                !name.contains("[anon") && !name.equals("")) continue;
-            try {
-                String[] range = parts[0].split("-");
-                long start = Long.parseLong(range[0], 16);
-                long end = Long.parseLong(range[1], 16);
-                long size = end - start;
-                if (size > 0 && size <= 200L * 1024 * 1024)
-                    regions.add(new long[]{start, end});
-            } catch (Exception ignored) {}
-        }
-        log("Регионов для сканирования: " + regions.size());
-
-        int totalPatched = 0;
-
-        // Патчим все паттерны
-        for (PatchRecord patch : PATCHES) {
-            byte[] search = restore ? patch.replace : patch.search;
-            byte[] replace = restore ? patch.search : patch.replace;
-            
-            int found = searchRegion(pid, regions, search, replace, patch.desc);
-            totalPatched += found;
-        }
-
-        if (totalPatched > 0)
-            log("── Готово! Пропатчено: " + totalPatched + " ──");
-        else
-            log("── Ничего не найдено. Зайди в выбор карты и повтори ──");
-
-        return totalPatched;
+        if (total == 0) log("Ничего не найдено — зайди в карту и нажми снова");
+        else log("── Готово: " + total + " замен ──");
+        return total;
     }
 
-    // ─────────────────────────── MEM IO ───────────────────────────────────
-    private byte[] readMem(String pid, long offset, long size) {
-        // Используем dd с root через временный файл
-        String tmp = "/data/local/tmp/osupatch_chunk.bin";
-        String cmd = "dd if=/proc/" + pid + "/mem of=" + tmp +
-            " bs=4096 skip=" + (offset / 4096) +
-            " count=" + ((size + 4095) / 4096) +
-            " 2>/dev/null";
-        shell(cmd);
-        // Читаем обратно
-        String hex = shell("xxd -p " + tmp + " 2>/dev/null | tr -d '\\n'");
-        if (hex.isEmpty()) return null;
+    // ─────────────────────── UTILS ────────────────────────────────────────
+    private static byte[] doubleToBytes(double v) {
+        ByteBuffer bb = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        bb.putDouble(v);
+        return bb.array();
+    }
+
+    private String su(String cmd) {
         try {
-            return hexToBytes(hex);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private boolean writeMem(String pid, long addr, byte[] data) {
-        // Пишем через /proc/PID/mem с помощью python одной строкой (если есть)
-        // или через dd с seek
-        String hex = bytesToHex(data);
-        String tmp = "/data/local/tmp/osupatch_write.bin";
-        // Записываем байты во временный файл через printf
-        StringBuilder printf = new StringBuilder("printf '");
-        for (byte b : data) printf.append(String.format("\\x%02x", b & 0xff));
-        printf.append("' > ").append(tmp);
-        shell(printf.toString());
-
-        // dd с seek в байтах (bs=1)
-        long blockSize = 512;
-        long skip = addr / blockSize;
-        long seekOffset = addr % blockSize;
-
-        // Используем Python если доступен (быстрее)
-        String pyCmd = "python3 -c \"" +
-            "import os; " +
-            "f=open('/proc/" + pid + "/mem','r+b',0); " +
-            "f.seek(" + addr + "); " +
-            "f.write(bytes.fromhex('" + hex + "')); " +
-            "f.close()\" 2>/dev/null";
-        String pyResult = shell(pyCmd);
-
-        // Если python недоступен — dd
-        if (!pyResult.contains("Error") && !pyResult.contains("not found")) {
-            return true;
-        }
-
-        String ddCmd = "dd if=" + tmp + " of=/proc/" + pid + "/mem" +
-            " bs=1 seek=" + addr + " conv=notrunc 2>/dev/null";
-        shell(ddCmd);
-        return true;
-    }
-
-    // ─────────────────────────── UTILS ────────────────────────────────────
-    private String shell(String cmd) {
-        try {
-            java.lang.Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
             BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
             StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+            String l; while ((l = br.readLine()) != null) sb.append(l).append("\n");
             p.waitFor();
             return sb.toString();
-        } catch (Exception e) {
-            return "";
-        }
+        } catch (Exception e) { return ""; }
     }
 
-    private static int indexOf(byte[] data, byte[] pattern, int fromIndex) {
-        outer:
-        for (int i = fromIndex; i <= data.length - pattern.length; i++) {
-            for (int j = 0; j < pattern.length; j++) {
-                if (data[i + j] != pattern[j]) continue outer;
-            }
+    private static int indexOf(byte[] data, byte[] pat, int from) {
+        outer: for (int i = from; i <= data.length - pat.length; i++) {
+            for (int j = 0; j < pat.length; j++) if (data[i+j] != pat[j]) continue outer;
             return i;
         }
         return -1;
     }
 
-    private static byte[] hexToBytes(String hex) {
-        int len = hex.length();
-        byte[] out = new byte[len / 2];
-        for (int i = 0; i < len; i += 2)
-            out[i / 2] = (byte) Integer.parseInt(hex.substring(i, i + 2), 16);
-        return out;
+    private static byte[] hexToBytes(String h) {
+        h = h.trim();
+        byte[] b = new byte[h.length()/2];
+        for (int i = 0; i < b.length; i++) b[i] = (byte)Integer.parseInt(h.substring(i*2, i*2+2), 16);
+        return b;
     }
 
     private static String bytesToHex(byte[] b) {
@@ -509,15 +417,14 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private void setStatus(String text, String color) {
-        tvStatus.setText(text);
-        tvStatus.setTextColor(Color.parseColor(color));
+    private void setStatus(String t, String c) {
+        mainHandler.post(() -> { tvStatus.setText(t); tvStatus.setTextColor(Color.parseColor(c)); });
     }
 
     private void log(String msg) {
         mainHandler.post(() -> {
             logBuf.append(msg).append("\n");
-            tvLog.setText(logBuf.toString());
+            tvLog.setText(logBuf);
             scrollLog.post(() -> scrollLog.fullScroll(View.FOCUS_DOWN));
         });
     }
