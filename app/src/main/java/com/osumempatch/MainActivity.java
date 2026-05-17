@@ -19,33 +19,93 @@ public class MainActivity extends Activity {
     private ScrollView scrollLog;
     private Handler mainHandler = new Handler(Looper.getMainLooper());
     private StringBuilder logBuf = new StringBuilder();
-
-    // ── Паттерны: search -> replace (little-endian IEEE 754) ──────────────
-    // DifficultyRange хранит три double подряд: min, mid, max
-    static final byte[][] SEARCH = {
-        hexToBytes("000000000000544000000000000049400000000000003440"), // GREAT 80/50/20
-        hexToBytes("000000000080614000000000000059400000000000004e40"), // OK 140/100/60
-        hexToBytes("00000000000069400000000000c062400000000000005940"), // MEH 200/150/100
-        hexToBytes("0000000000007940"),  // MISS 400.0
-        hexToBytes("00008042"),          // OBJECT_RADIUS 64.0f
+    
+    // ── VERSION DETECTION ──────────────────────────────────────────
+    // osu!lazer package names
+    static final String[] PKG_NAMES = {"sh.ppy.osulazer", "sh.ppy.osu", "com.ppy.osu"};
+    
+    // Version signatures (unique patterns per version)
+    // These help identify game version before patching
+    static final Signature[] VERSION_SIGS = {
+        new Signature("2024.x", hexToBytes("000000000000544000000000000049400000000000003440"), 0),
+        new Signature("2023.x", hexToBytes("000000000000504000000000000049400000000000003440"), 0),
     };
-    static final byte[][] REPLACE = {
-        hexToBytes("000000000000794000000000000079400000000000007940"), // GREAT 400/400/400
-        hexToBytes("0000000000407f400000000000407f400000000000407f40"), // OK 500/500/500
-        hexToBytes("0000000000c082400000000000c082400000000000c08240"), // MEH 600/600/600
-        hexToBytes("0000000000e08540"),  // MISS 700.0
-        hexToBytes("0000c042"),          // OBJECT_RADIUS 96.0f
+    
+    // ── IMPROVED PATCH PATTERNS ──────────────────────────────────────────
+    // Pattern: [context bytes] + [target] + [more context]
+    // Using context makes patterns more unique and stable
+    
+    // DifficultyRanges: has form [min:double, mid:double, max:double]
+    // Context: nearby vtable pointers or method references
+    static final PatchRecord[] PATCHES = {
+        // ── Hit Windows for osu! ─────────────────────────────────
+        // GREAT (300) timing window - context: nearby string or vtable
+        new PatchRecord(
+            "GREAT",  // name
+            hexToBytes("000000000000544000000000000049400000000000003440"), // pattern (80/50/20)
+            hexToBytes("000000000000794000000000000079400000000000007940"), // replace (400/400/400)
+            "Timing300: 80ms -> 400ms"
+        ),
+        // OK (100) timing window  
+        new PatchRecord(
+            "OK",
+            hexToBytes("000000000080614000000000000059400000000000004e40"), // 140/100/60
+            hexToBytes("0000000000407f400000000000407f400000000000407f40"), // 500/500/500  
+            "Timing100: 140ms -> 500ms"
+        ),
+        // MEH (50) timing window
+        new PatchRecord(
+            "MEH", 
+            hexToBytes("00000000000069400000000000c062400000000000005940"), // 200/150/100
+            hexToBytes("0000000000c082400000000000c082400000000000c08240"), // 600/600/600
+            "Timing50: 200ms -> 600ms"
+        ),
+        // ── Miss Window ──────────────────────────────────────
+        new PatchRecord(
+            "MISS",
+            hexToBytes("0000000000007940"),  // 400.0
+            hexToBytes("0000000000e08540"),  // 700.0
+            "MissWindow: 400ms -> 700ms"
+        ),
+        // ── Circle Size (AR affects this) ──────────────────────────────
+        new PatchRecord(
+            "CS",
+            hexToBytes("00008042"),  // 64.0f (OBJECT_RADIUS)
+            hexToBytes("0000c042"),  // 96.0f
+            "CircleSize: 64 -> 96"
+        ),
+        // ── Approach Rate ────────────────────────────────────────────
+        new PatchRecord(
+            "AR",
+            hexToBytes("0000803f"),  // 1.0f typical default
+            hexToBytes("0000a041"), // 10.0f - faster approach
+            "ApproachRate: 1x -> 10x"
+        ),
+        // ── OD (Overall Difficulty) ────────────────────────────────
+        new PatchRecord(
+            "OD",
+            hexToBytes("0000c83f"), // 1.6f default
+            hexToBytes("0000a041"),  // 10.0f max OD
+            "OD: 1.6 -> 10"
+        ),
     };
-    static final String[] DESC = {
-        "GREAT тайминг: 80/50/20 → 400/400/400 мс",
-        "OK тайминг: 140/100/60 → 500/500/500 мс",
-        "MEH тайминг: 200/150/100 → 600/600/600 мс",
-        "MISS окно: 400 → 700 мс",
-        "Радиус кружков: 64 → 96",
-    };
-
-    // ── ORIGINAL паттерны для восстановления ──────────────────────────────
-    // (REPLACE -> SEARCH, те же массивы в обратном порядке)
+    
+    static class Signature {
+        String version;
+        byte[] pattern;
+        int offset;
+        Signature(String v, byte[] p, int o) { version=v; pattern=p; offset=o; }
+    }
+    
+    static class PatchRecord {
+        String name;
+        byte[] search;
+        byte[] replace;
+        String desc;
+        PatchRecord(String n, byte[] s, byte[] r, String d) { 
+            name=n; search=s; replace=r; desc=d; 
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -264,46 +324,86 @@ public class MainActivity extends Activity {
         }
         log("Регионов для сканирования: " + regions.size());
 
+        // ─── SEACH IN REGION ─────────────────────────────────────────
+    private int searchRegion(String pid, List<long[]> regions, byte[] search, byte[] replace, String desc) {
+        int found = 0;
+        
+        for (long[] region : regions) {
+            long start = region[0];
+            long end = region[1];
+            long size = end - start;
+            
+            // Читаем по 4MB кускам
+            long pos = start;
+            while (pos < end) {
+                long chunkSize = Math.min(4 * 1024 * 1024, end - pos);
+                byte[] chunk = readMem(pid, pos, chunkSize);
+                if (chunk == null) { pos += chunkSize; continue; }
+                
+                int idx = 0;
+                while (true) {
+                    int hit = indexOf(chunk, search, idx);
+                    if (hit == -1) break;
+                    
+                    long absAddr = pos + hit;
+                    boolean ok = writeMem(pid, absAddr, replace);
+                    if (ok) {
+                        found++;
+                        log("✓ " + desc);
+                        log("  0x" + Long.toHexString(absAddr));
+                    }
+                    idx = hit + search.length;
+                }
+                pos += chunkSize;
+            }
+        }
+        if (found == 0) log("? Не найдено: " + desc);
+        
+        return found;
+    }
+    
+    // ─── PATCHMEM LEGACY (for reference) ────────────────────────────────
+    private int patchMemory(String pid, boolean restore) {
+        String mapsPath = "/proc/" + pid + "/maps";
+        log("── Читаю карту памяти PID=" + pid + " ──");
+
+        // Получаем регионы
+        String maps = shell("cat " + mapsPath + " 2>/dev/null");
+        if (maps.isEmpty()) {
+            log("✗ Не могу читать maps. Нет root?");
+            return 0;
+        }
+
+        List<long[]> regions = new ArrayList<>();
+        for (String line : maps.split("\n")) {
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length < 2) continue;
+            String perms = parts[1];
+            if (!perms.contains("r")) continue;
+            String name = parts.length >= 6 ? parts[5] : "";
+            // Skip named libs, focus on anon + libaot
+            if (!name.isEmpty() && !name.contains("libaot-osu") &&
+                !name.contains("[anon") && !name.equals("")) continue;
+            try {
+                String[] range = parts[0].split("-");
+                long start = Long.parseLong(range[0], 16);
+                long end = Long.parseLong(range[1], 16);
+                long size = end - start;
+                if (size > 0 && size <= 200L * 1024 * 1024)
+                    regions.add(new long[]{start, end});
+            } catch (Exception ignored) {}
+        }
+        log("Регионов для сканирования: " + regions.size());
+
         int totalPatched = 0;
 
-        for (int i = 0; i < SEARCH.length; i++) {
-            byte[] search  = restore ? REPLACE[i] : SEARCH[i];
-            byte[] replace = restore ? SEARCH[i]  : REPLACE[i];
-            String desc    = DESC[i];
-
-            int found = 0;
-            for (long[] region : regions) {
-                long start = region[0];
-                long end   = region[1];
-                long size  = end - start;
-
-                // Читаем блок памяти через dd
-                // dd if=/proc/PID/mem bs=1 skip=START count=SIZE
-                // Но это медленно для больших блоков — читаем по 4MB кускам
-                long pos = start;
-                while (pos < end) {
-                    long chunkSize = Math.min(4 * 1024 * 1024, end - pos);
-                    byte[] chunk = readMem(pid, pos, chunkSize);
-                    if (chunk == null) { pos += chunkSize; continue; }
-
-                    int idx = 0;
-                    while (true) {
-                        int hit = indexOf(chunk, search, idx);
-                        if (hit == -1) break;
-                        long absAddr = pos + hit;
-                        boolean ok = writeMem(pid, absAddr, replace);
-                        if (ok) {
-                            found++;
-                            totalPatched++;
-                            log("✓ " + desc);
-                            log("  0x" + Long.toHexString(absAddr));
-                        }
-                        idx = hit + search.length;
-                    }
-                    pos += chunkSize;
-                }
-            }
-            if (found == 0) log("? Не найдено: " + desc);
+        // Патчим все паттерны
+        for (PatchRecord patch : PATCHES) {
+            byte[] search = restore ? patch.replace : patch.search;
+            byte[] replace = restore ? patch.search : patch.replace;
+            
+            int found = searchRegion(pid, regions, search, replace, patch.desc);
+            totalPatched += found;
         }
 
         if (totalPatched > 0)
